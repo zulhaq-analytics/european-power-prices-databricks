@@ -9,6 +9,10 @@ ops.silver_file_log so each run only handles new files.
 Resolution rule: for prices the hourly series wins when present (before the
 October 2025 move to 15-minute trading, any 15-minute price series is a
 different product); for quantities the finest resolution wins.
+
+Batching: rows are written in batches of at most MAX_ROWS. Large files are
+split only at hour boundaries, so every hour is aggregated from all its points.
+A file is logged as processed only after all its rows are written.
 """
 import glob
 import datetime as dt
@@ -22,6 +26,7 @@ CATALOG = "power_prices"
 RAW_ROOT = f"/Volumes/{CATALOG}/bronze/raw_files"
 FILE_LOG = f"{CATALOG}.ops.silver_file_log"
 DIM_ZONE = f"{CATALOG}.gold.dim_bidding_zone"
+MAX_ROWS = 400_000
 
 FIELDS = ["document_type", "series_mrid", "business_type", "in_domain", "out_domain", "psr_type",
           "curve_type", "unit", "currency", "measure", "resolution", "period_start", "position",
@@ -32,6 +37,7 @@ PARSED_SCHEMA = (
     "measure STRING, resolution STRING, period_start TIMESTAMP, position INT, "
     "timestamp_utc TIMESTAMP, value DOUBLE, is_filled BOOLEAN, source_file STRING"
 )
+FILE_LOG_SCHEMA = "file_path STRING, dataset STRING, rows_parsed BIGINT, processed_at TIMESTAMP"
 
 # Raw folder (dataset) -> silver table
 DATASET_TABLE = {
@@ -112,8 +118,7 @@ def ensure_tables(spark):
         )
         spark.sql(f"CREATE TABLE IF NOT EXISTS {CATALOG}.silver.{name} (\n  {cols}\n) "
                   f"COMMENT '{spec['comment']}'")
-    spark.sql(f"""CREATE TABLE IF NOT EXISTS {FILE_LOG} (
-        file_path STRING, dataset STRING, rows_parsed BIGINT, processed_at TIMESTAMP)
+    spark.sql(f"""CREATE TABLE IF NOT EXISTS {FILE_LOG} ({FILE_LOG_SCHEMA})
         COMMENT 'Raw files already processed into silver'""")
 
 
@@ -204,6 +209,42 @@ def _merge(spark, df, table):
 
 
 # ---------------------------------------------------------------
+# Batching helpers
+# ---------------------------------------------------------------
+def _hour_slices(rows, max_rows):
+    """Sort a file's rows by time and cut them into slices of about max_rows, only at hour boundaries."""
+    rows.sort(key=lambda r: r["timestamp_utc"])
+    slices, current, current_hour = [], [], None
+    for r in rows:
+        hour = r["timestamp_utc"].replace(minute=0, second=0, microsecond=0)
+        if len(current) >= max_rows and hour != current_hour:
+            slices.append(current)
+            current = []
+        current.append(r)
+        current_hour = hour
+    if current:
+        slices.append(current)
+    return slices
+
+
+def _write(spark, table, dataset, rows):
+    """Aggregate one batch of parsed rows to silver and MERGE it. Returns rows written."""
+    raw = spark.createDataFrame([tuple(r[k] for k in FIELDS) for r in rows], PARSED_SCHEMA)
+    df = _build(spark, table, dataset, raw)
+    n = df.count()
+    _merge(spark, df, table)
+    return n
+
+
+def _log_files(spark, entries):
+    if not entries:
+        return
+    now = dt.datetime.now(dt.timezone.utc)
+    (spark.createDataFrame([(p, d, n, now) for p, d, n in entries], FILE_LOG_SCHEMA)
+          .write.mode("append").saveAsTable(FILE_LOG))
+
+
+# ---------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------
 def pending_files(spark, dataset, reprocess=False):
@@ -215,7 +256,7 @@ def pending_files(spark, dataset, reprocess=False):
     return [f for f in files if f not in done]
 
 
-def run(spark, datasets=None, reprocess=False, batch_size=100):
+def run(spark, datasets=None, reprocess=False, max_rows=MAX_ROWS):
     """Process new raw files into silver. Returns [(dataset, files, rows_parsed, rows_written)]."""
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     ensure_tables(spark)
@@ -223,26 +264,26 @@ def run(spark, datasets=None, reprocess=False, batch_size=100):
     for dataset in datasets or list(DATASET_TABLE):
         table = DATASET_TABLE[dataset]
         files = pending_files(spark, dataset, reprocess)
+        buffer, files_in_buffer = [], []
         n_rows, n_written = 0, 0
-        for i in range(0, len(files), batch_size):
-            batch = files[i:i + batch_size]
-            rows, per_file = [], []
-            for path in batch:
-                with open(path, "rb") as f:
-                    parsed = parse(f.read())
-                for r in parsed:
-                    r["source_file"] = path
-                rows.extend(parsed)
-                per_file.append((path, dataset, len(parsed)))
-            if rows:
-                raw = spark.createDataFrame([tuple(r[k] for k in FIELDS) for r in rows], PARSED_SCHEMA)
-                df = _build(spark, table, dataset, raw)
-                n_written += df.count()
-                _merge(spark, df, table)
-            n_rows += len(rows)
-            now = dt.datetime.now(dt.timezone.utc)
-            (spark.createDataFrame([(p, d, n, now) for p, d, n in per_file],
-                                   "file_path STRING, dataset STRING, rows_parsed BIGINT, processed_at TIMESTAMP")
-                  .write.mode("append").saveAsTable(FILE_LOG))
+
+        for path in files:
+            with open(path, "rb") as f:
+                parsed = parse(f.read())
+            for r in parsed:
+                r["source_file"] = path
+            n_rows += len(parsed)
+
+            for piece in _hour_slices(parsed, max_rows):
+                if buffer and len(buffer) + len(piece) > max_rows:
+                    n_written += _write(spark, table, dataset, buffer)
+                    _log_files(spark, files_in_buffer)      # files fully written by this batch
+                    buffer, files_in_buffer = [], []
+                buffer.extend(piece)
+            files_in_buffer.append((path, dataset, len(parsed)))
+
+        if buffer:
+            n_written += _write(spark, table, dataset, buffer)
+        _log_files(spark, files_in_buffer)
         summary.append((dataset, len(files), n_rows, n_written))
     return summary
