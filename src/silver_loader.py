@@ -5,6 +5,10 @@ Reads raw ENTSO-E XML files from the bronze volume, parses them, normalizes
 to hourly UTC, maps EIC codes to zone codes, adds local date/hour per zone,
 and MERGEs into silver Delta tables. Processed files are tracked in
 ops.silver_file_log so each run only handles new files.
+
+Resolution rule: for prices the hourly series wins when present (before the
+October 2025 move to 15-minute trading, any 15-minute price series is a
+different product); for quantities the finest resolution wins.
 """
 import glob
 import datetime as dt
@@ -57,7 +61,7 @@ TABLES = {
         "keys": ["zone_code", "timestamp_utc"],
         "columns": [("zone_code", "STRING", "Bidding zone, FK to gold.dim_bidding_zone"),
                     ("timestamp_utc", "TIMESTAMP", "Start of the hour, UTC")] + _LOCAL +
-                   [("price_eur_mwh", "DOUBLE", "Day-ahead price, EUR/MWh; hourly mean of sub-hourly prices")] + _LINEAGE,
+                   [("price_eur_mwh", "DOUBLE", "Day-ahead price, EUR/MWh; hourly series, or mean of 15-minute prices after the move to 15-minute trading")] + _LINEAGE,
     },
     "load": {
         "comment": "Hourly actual and day-ahead forecast load per bidding zone",
@@ -121,12 +125,17 @@ def _res_minutes(col):
              .when(col.rlike(r"^PT\d+H$"), F.regexp_extract(col, r"^PT(\d+)H$", 1).cast("int") * 60))
 
 
-def _hourly(df, group_cols):
-    """Keep the finest resolution per group and hour, then average to hourly."""
+def _hourly(df, group_cols, prefer="finest"):
+    """
+    Pick one resolution per group and hour, then average to hourly.
+    prefer='finest'   -> smallest resolution wins (quantities)
+    prefer='coarsest' -> largest resolution wins (prices: hourly auction series over other 15-minute products)
+    """
     df = (df.withColumn("hour_utc", F.date_trunc("hour", "timestamp_utc"))
             .withColumn("res_min", _res_minutes(F.col("resolution"))))
     w = Window.partitionBy(*group_cols, "hour_utc")
-    df = df.withColumn("min_res", F.min("res_min").over(w)).filter(F.col("res_min") == F.col("min_res"))
+    pick = F.max("res_min") if prefer == "coarsest" else F.min("res_min")
+    df = df.withColumn("pick_res", pick.over(w)).filter(F.col("res_min") == F.col("pick_res"))
     return (df.groupBy(*group_cols, "hour_utc")
               .agg(F.avg("value").alias("value"),
                    F.count("*").cast("int").alias("points_in_hour"),
@@ -150,7 +159,7 @@ def _build(spark, table, dataset, raw):
 
     if table == "price":
         df = raw.join(eic, raw.in_domain == eic._eic)
-        df = add_local(_hourly(df, ["zone_code"]).withColumnRenamed("value", "price_eur_mwh"))
+        df = add_local(_hourly(df, ["zone_code"], prefer="coarsest").withColumnRenamed("value", "price_eur_mwh"))
 
     elif table == "load":
         df = (raw.join(eic, raw.out_domain == eic._eic)
