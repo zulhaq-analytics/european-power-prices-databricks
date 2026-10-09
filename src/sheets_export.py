@@ -1,10 +1,11 @@
 """
-Gold -> Google Sheets.
+Gold -> Google Sheets (one spreadsheet per table).
 
-Writes each gold table Tableau needs to its own tab of the serving
-spreadsheet: full replace, exact tab sizing (empty cells count toward
-the 10M-cell limit), user-entered values so types are kept, chunked
-writes with retry on rate limits.
+Tableau Public reads a Google Sheet by asking Google Drive to export the whole
+file as Excel, and Drive refuses exports above its size limit. So every gold
+table Tableau needs gets its own spreadsheet. Each run: full replace, exact
+tab sizing, user-entered values so types are kept, chunked writes with retry,
+then a test export to report each file's Excel size against the limit.
 """
 import math
 import time
@@ -13,23 +14,25 @@ import datetime as dt
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
+from google.auth.transport.requests import AuthorizedSession
 
 CATALOG = "power_prices"
-SHEET_ID = "1bam2ByYUsriJbkfJp5o3SQXRBtwOWSNNFQ1lCziT1yc"
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive.readonly"]
 CHUNK_ROWS = 10000
-CELL_LIMIT = 10_000_000
+CELL_LIMIT = 10_000_000          # Google Sheets cells per spreadsheet
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-TABLES = [
-    "dim_zone_display",
-    "agg_refresh_info",
-    "agg_price_daily",
-    "agg_price_profile",
-    "agg_generation_monthly",
-    "agg_border_monthly",
-    "agg_tomorrow_hourly",
-]
-OBSOLETE_TABS = ["_connection_test", "Sheet1"]
+# Gold table -> its own spreadsheet (ID from the sheet URL)
+SHEETS = {
+    "dim_zone_display":       "13xvvdYDflLTblPeotp0Pc3QYloWGpHuUhpp8miyuiRY",
+    "agg_refresh_info":       "1LV7Tx6pAZzms_CJHVxcYxIbtJ4A_Q_ragcmrWmsAMjY",
+    "agg_price_daily":        "19qMZHhjEUaWkEDWAW18RtlRyjwkEuwi8x3zsr-Ojo8w",
+    "agg_price_profile":      "1SJpcQbrT7t8HpIemH46U8PijyfQhj9Ya1SSiIzbN8Ps",
+    "agg_generation_monthly": "1_g10DHOicO58knqiOL06_MYCQwJWVDJE8i4SiE08ZVQ",
+    "agg_border_monthly":     "1NEN2Ae9Mr85gw7Sqib6v6wCY_SjUVEga_Smssx1d2zc",
+    "agg_tomorrow_hourly":    "1XgGQEbI2JuzMdoiMru-pVT-VxW05SeKnHqcRzwmrghw",
+}
 
 
 def _retry(fn, *args, **kwargs):
@@ -74,34 +77,50 @@ def _values(pdf):
     return rows
 
 
-def export(spark, sa_info, sheet_id=SHEET_ID, tables=None):
-    """Write gold tables to their tabs. Returns [(table, data_rows, cols, cells)]."""
+def _export_size(session, sheet_id):
+    """Ask Drive to export the file as Excel, the way Tableau does. Returns a short status string."""
+    r = session.get(f"https://www.googleapis.com/drive/v3/files/{sheet_id}/export",
+                    params={"mimeType": XLSX}, timeout=300)
+    if r.status_code == 200:
+        return f"OK, {len(r.content) / 1e6:.1f} MB"
+    try:
+        reason = r.json()["error"]["errors"][0].get("reason", r.status_code)
+    except Exception:
+        reason = r.status_code
+    return f"REFUSED ({reason})"
+
+
+def export(spark, sa_info, tables=None, measure=True):
+    """Write gold tables to their spreadsheets. Returns [(table, data_rows, cols, cells, export_status)]."""
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-    sh = _retry(gspread.authorize(creds).open_by_key, sheet_id)
-    existing = {ws.title: ws for ws in _retry(sh.worksheets)}
+    gc = gspread.authorize(creds)
+    session = AuthorizedSession(creds)
 
     summary = []
-    for name in tables or TABLES:
+    for name in tables or list(SHEETS):
+        sheet_id = SHEETS[name]
         values = _values(spark.table(f"{CATALOG}.gold.{name}").toPandas())
         n_rows, n_cols = len(values), len(values[0])
         tab_rows = max(n_rows, 2)          # header-only tabs keep one spare row so the header can be frozen
 
-        ws = existing.get(name)
-        if ws is None:
-            ws = _retry(sh.add_worksheet, title=name, rows=tab_rows, cols=n_cols)
+        sh = _retry(gc.open_by_key, sheet_id)
+        tabs = _retry(sh.worksheets)
+        ws = next((w for w in tabs if w.title == name), None)
+        if ws is None:                     # new file: rename its first tab to the table name
+            ws = tabs[0]
+            _retry(ws.update_title, name)
+        for w in tabs:                     # one tab per file
+            if w.id != ws.id:
+                _retry(sh.del_worksheet, w)
+
         _retry(ws.clear)
         _retry(ws.resize, rows=tab_rows, cols=n_cols)
         for i in range(0, n_rows, CHUNK_ROWS):
             _retry(ws.update, range_name=f"A{i + 1}", values=values[i:i + CHUNK_ROWS],
                    value_input_option="USER_ENTERED")
         _retry(ws.freeze, rows=1)
-        summary.append((name, n_rows - 1, n_cols, tab_rows * n_cols))
 
-    # Remove tabs that are no longer used (a spreadsheet must keep at least one tab)
-    for title in OBSOLETE_TABS:
-        tabs = {w.title: w for w in _retry(sh.worksheets)}
-        if title in tabs and len(tabs) > 1:
-            _retry(sh.del_worksheet, tabs[title])
-
+        status = _export_size(session, sheet_id) if measure else "not measured"
+        summary.append((name, n_rows - 1, n_cols, tab_rows * n_cols, status))
     return summary
