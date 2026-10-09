@@ -2,10 +2,11 @@
 Gold -> Google Sheets (one spreadsheet per table).
 
 Tableau Public reads a Google Sheet by asking Google Drive to export the whole
-file as Excel, and Drive refuses exports above its size limit. So every gold
-table Tableau needs gets its own spreadsheet. Each run: full replace, exact
-tab sizing, user-entered values so types are kept, chunked writes with retry,
-then a test export to report each file's Excel size against the limit.
+file as Excel, and Drive refuses exports above its size limit (~10 MB). So every
+gold table Tableau needs gets its own spreadsheet, and wide tables are trimmed
+to the columns the dashboard uses (the full tables stay in Databricks gold).
+Each run: full replace, exact tab sizing, user-entered values so types are kept,
+chunked writes with retry, then a test export to report each file's Excel size.
 """
 import math
 import time
@@ -32,6 +33,17 @@ SHEETS = {
     "agg_generation_monthly": "1_g10DHOicO58knqiOL06_MYCQwJWVDJE8i4SiE08ZVQ",
     "agg_border_monthly":     "1NEN2Ae9Mr85gw7Sqib6v6wCY_SjUVEga_Smssx1d2zc",
     "agg_tomorrow_hourly":    "1XgGQEbI2JuzMdoiMru-pVT-VxW05SeKnHqcRzwmrghw",
+}
+
+# Columns sent to Tableau for wide tables (others are sent in full)
+EXPORT_COLUMNS = {
+    "agg_price_daily": [
+        "zone_code", "date",
+        "avg_price_eur_mwh", "min_price_eur_mwh", "max_price_eur_mwh",
+        "peak_price_eur_mwh", "offpeak_price_eur_mwh",
+        "solar_window_price_eur_mwh", "evening_peak_price_eur_mwh",
+        "negative_hours", "renewable_share",
+    ],
 }
 
 
@@ -100,7 +112,10 @@ def export(spark, sa_info, tables=None, measure=True):
     summary = []
     for name in tables or list(SHEETS):
         sheet_id = SHEETS[name]
-        values = _values(spark.table(f"{CATALOG}.gold.{name}").toPandas())
+        df = spark.table(f"{CATALOG}.gold.{name}")
+        if name in EXPORT_COLUMNS:
+            df = df.select(*EXPORT_COLUMNS[name])
+        values = _values(df.toPandas())
         n_rows, n_cols = len(values), len(values[0])
         tab_rows = max(n_rows, 2)          # header-only tabs keep one spare row so the header can be frozen
 
