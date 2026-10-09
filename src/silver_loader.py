@@ -13,7 +13,12 @@ different product); for quantities the finest resolution wins.
 Batching: rows are written in batches of at most MAX_ROWS. Large files are
 split only at hour boundaries, so every hour is aggregated from all its points.
 A file is logged as processed only after all its rows are written.
+
+File discovery: pending files come from ops.api_call_log (every successful
+call records its file path), not from listing the volume, which can be very
+slow. discover="glob" lists the volume instead (used by the unit tests).
 """
+import gc
 import glob
 import datetime as dt
 
@@ -25,6 +30,7 @@ from entsoe_parser import parse
 CATALOG = "power_prices"
 RAW_ROOT = f"/Volumes/{CATALOG}/bronze/raw_files"
 FILE_LOG = f"{CATALOG}.ops.silver_file_log"
+CALL_LOG = f"{CATALOG}.ops.api_call_log"
 DIM_ZONE = f"{CATALOG}.gold.dim_bidding_zone"
 MAX_ROWS = 400_000
 
@@ -247,25 +253,50 @@ def _log_files(spark, entries):
 # ---------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------
-def pending_files(spark, dataset, reprocess=False):
-    files = sorted(glob.glob(f"{RAW_ROOT}/{dataset}/**/*.xml", recursive=True))
+def pending_files(spark, dataset, reprocess=False, discover="log"):
+    """
+    Raw files still to load for a dataset, in path order.
+    discover='log'  -> from ops.api_call_log (fast; every successful call recorded its file)
+    discover='glob' -> list the volume folders (slow on large volumes; used by unit tests)
+    """
+    if discover == "glob":
+        files = sorted(glob.glob(f"{RAW_ROOT}/{dataset}/**/*.xml", recursive=True))
+    else:
+        files = sorted({r.file_path for r in spark.sql(f"""
+            SELECT DISTINCT file_path FROM {CALL_LOG}
+            WHERE dataset = '{dataset}' AND outcome = 'ok' AND file_path IS NOT NULL
+        """).collect()})
     if reprocess:
         return files
-    done = {r.file_path for r in spark.table(FILE_LOG).filter(F.col("dataset") == dataset)
-                                          .select("file_path").collect()}
+    done = {r.file_path for r in spark.sql(f"""
+        SELECT DISTINCT file_path FROM {FILE_LOG} WHERE dataset = '{dataset}'
+    """).collect()}
     return [f for f in files if f not in done]
 
 
-def run(spark, datasets=None, reprocess=False, max_rows=MAX_ROWS):
+def run(spark, datasets=None, reprocess=False, max_rows=MAX_ROWS, discover="log", verbose=True):
     """Process new raw files into silver. Returns [(dataset, files, rows_parsed, rows_written)]."""
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     ensure_tables(spark)
     summary = []
     for dataset in datasets or list(DATASET_TABLE):
         table = DATASET_TABLE[dataset]
-        files = pending_files(spark, dataset, reprocess)
+        files = pending_files(spark, dataset, reprocess, discover)
         buffer, files_in_buffer = [], []
-        n_rows, n_written = 0, 0
+        n_rows, n_written, n_files_done, n_batches = 0, 0, 0, 0
+
+        def flush():
+            nonlocal buffer, files_in_buffer, n_written, n_files_done, n_batches
+            n_written += _write(spark, table, dataset, buffer)
+            _log_files(spark, files_in_buffer)
+            n_files_done += len(files_in_buffer)
+            n_batches += 1
+            if verbose:
+                print(f"   {dataset}: batch {n_batches} saved | files done {n_files_done}/{len(files)} "
+                      f"| rows written {n_written:,} | {dt.datetime.now(dt.timezone.utc):%H:%M:%S} UTC",
+                      flush=True)
+            buffer, files_in_buffer = [], []
+            gc.collect()
 
         for path in files:
             with open(path, "rb") as f:
@@ -276,14 +307,15 @@ def run(spark, datasets=None, reprocess=False, max_rows=MAX_ROWS):
 
             for piece in _hour_slices(parsed, max_rows):
                 if buffer and len(buffer) + len(piece) > max_rows:
-                    n_written += _write(spark, table, dataset, buffer)
-                    _log_files(spark, files_in_buffer)      # files fully written by this batch
-                    buffer, files_in_buffer = [], []
+                    flush()
                 buffer.extend(piece)
             files_in_buffer.append((path, dataset, len(parsed)))
+            del parsed
 
-        if buffer:
-            n_written += _write(spark, table, dataset, buffer)
-        _log_files(spark, files_in_buffer)
+        if buffer or files_in_buffer:
+            if buffer:
+                flush()
+            else:
+                _log_files(spark, files_in_buffer)
         summary.append((dataset, len(files), n_rows, n_written))
     return summary
