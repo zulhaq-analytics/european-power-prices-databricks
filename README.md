@@ -2,7 +2,7 @@
 
 I built this project to answer the questions an energy trader or analyst asks every morning about European power: where electricity is cheap or expensive, when prices go below zero, how solar reshapes the day, how much neighbors trade with each other, and what each country generates.
 
-I used seven years of official hourly data for 41 European bidding zones and built the full pipeline myself on Databricks, from raw API files to a Tableau dashboard that refreshes every day.
+I used seven years of official hourly data for 41 European bidding zones and built the full pipeline on Databricks, from raw API files to a Tableau dashboard that refreshes every day.
 
 `Databricks` · `PySpark` · `Spark SQL` · `Delta Lake` · `Python` · `Tableau` · `Google Sheets API` · `Claude (AI-assisted development)`
 
